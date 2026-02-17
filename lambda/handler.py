@@ -57,93 +57,104 @@ def lambda_handler(event, context):
 
 def classify_incident(query: str, context: dict) -> dict:
     """
-    Classify incident using AI (simplified for Phase 1)
+    Classify incident using REAL AI (not keyword matching)
     
-    In production, this would call OpenAI/Anthropic/Gemini API
-    For now, using simple pattern matching
+    This Lambda is a GATEWAY, not the intelligence.
+    Delegates to actual LLM for reasoning.
     """
     
-    query_lower = query.lower()
+    # Get AI provider from environment
+    ai_provider = os.environ.get('AI_PROVIDER', 'gemini')
+    ai_api_key = os.environ.get('AI_API_KEY')
     
-    # Simple classification logic
-    if any(word in query_lower for word in ['cpu', 'memory', 'disk', 'high']):
-        primary_class = 'resource_saturation'
-        confidence = 0.85
-    elif any(word in query_lower for word in ['slow', 'latency', 'timeout']):
-        primary_class = 'performance_degradation'
-        confidence = 0.80
-    elif any(word in query_lower for word in ['down', 'unavailable', 'crash']):
-        primary_class = 'availability_loss'
-        confidence = 0.90
-    elif any(word in query_lower for word in ['deploy', 'release', 'version']):
-        primary_class = 'deployment_regression'
-        confidence = 0.75
+    if not ai_api_key:
+        # Fallback to simple classification only for demo
+        return fallback_classification(query)
+    
+    # Call REAL AI
+    if ai_provider == 'gemini':
+        return classify_with_gemini(query, context, ai_api_key)
+    elif ai_provider == 'openai':
+        return classify_with_openai(query, context, ai_api_key)
     else:
-        primary_class = 'unknown'
-        confidence = 0.50
+        return fallback_classification(query)
+
+
+def classify_with_gemini(query: str, context: dict, api_key: str) -> dict:
+    """Use Google Gemini for classification"""
+    import requests
     
-    # Extract resource type
-    resource_type = None
-    if 'rds' in query_lower or 'database' in query_lower:
-        resource_type = 'rds'
-    elif 'ec2' in query_lower or 'instance' in query_lower:
-        resource_type = 'ec2'
-    elif 'lambda' in query_lower:
-        resource_type = 'lambda'
-    elif 'pod' in query_lower or 'kubernetes' in query_lower:
-        resource_type = 'pod'
+    prompt = f"""Classify this cloud operations incident into ONE of these classes:
+- resource_saturation
+- load_spike
+- configuration_drift
+- dependency_failure
+- scaling_failure
+- network_connectivity
+- permission_failure
+- cost_anomaly
+- deployment_regression
+- availability_loss
+- performance_degradation
+- data_inconsistency
+
+Query: "{query}"
+
+Return JSON only:
+{{"primary_class": "...", "confidence": 0.0-1.0, "resource_type": "...", "reasoning": "..."}}"""
     
+    response = requests.post(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
+        headers={'Content-Type': 'application/json'},
+        params={'key': api_key},
+        json={
+            'contents': [{'parts': [{'text': prompt}]}],
+            'generationConfig': {'temperature': 0.0}
+        },
+        timeout=10
+    )
+    
+    if response.status_code == 200:
+        result = response.json()
+        text = result['candidates'][0]['content']['parts'][0]['text']
+        # Extract JSON from response
+        import re
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group())
+    
+    return fallback_classification(query)
+
+
+def fallback_classification(query: str) -> dict:
+    """Fallback when AI is not available - minimal logic"""
     return {
-        'primary_class': primary_class,
-        'confidence': confidence,
-        'resource_type': resource_type,
-        'query': query
+        'primary_class': 'unknown',
+        'confidence': 0.3,
+        'resource_type': None,
+        'query': query,
+        'note': 'AI provider not configured - using fallback'
     }
 
 
 def generate_plan(classification: dict) -> dict:
     """
-    Generate diagnostic plan based on incident class
+    Generate diagnostic plan - delegates to reasoning planner
+    
+    This Lambda is a GATEWAY, not the planner.
+    Returns strategy reference, not hard-coded primitives.
     """
     
     incident_class = classification['primary_class']
     
-    # Map incident class to primitives
-    strategies = {
-        'resource_saturation': [
-            'analyze_utilization',
-            'compare_baseline',
-            'find_top_consumers',
-            'check_scaling_behavior',
-            'check_recent_changes'
-        ],
-        'performance_degradation': [
-            'analyze_latency',
-            'compare_baseline',
-            'trace_dependencies',
-            'check_recent_changes'
-        ],
-        'availability_loss': [
-            'check_resource_status',
-            'check_health_checks',
-            'trace_dependencies',
-            'check_recent_changes'
-        ],
-        'deployment_regression': [
-            'check_deployment_status',
-            'compare_versions',
-            'analyze_error_rate',
-            'check_recent_changes'
-        ]
-    }
-    
-    primitives = strategies.get(incident_class, ['analyze_utilization', 'check_recent_changes'])
+    # Return strategy reference, let client-side planner handle it
+    # OR call a planning service (future enhancement)
     
     return {
         'plan_id': f"plan-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
         'incident_class': incident_class,
-        'primitives': primitives,
-        'estimated_duration_seconds': len(primitives) * 3
+        'strategy': incident_class,  # Reference to strategy, not primitives
+        'note': 'Client should use ReasoningPlanner to generate primitives'
     }
 
 
@@ -217,22 +228,40 @@ def generate_recommendations(classification: dict, plan: dict) -> dict:
     return recommendations.get(incident_class, {'actions': default_actions})
 
 
-def validate_api_key(api_key: str) -> bool:
+def validate_api_key(api_key: str, event: dict) -> dict:
     """
-    Validate API key
+    Validate API key and return user context
     
-    For Phase 1, using simple validation.
-    In production, check against DynamoDB table.
+    Returns: {'valid': bool, 'user_id': str, 'tenant_id': str, 'permissions': []}
+    
+    TODO: Replace with proper auth:
+    - DynamoDB lookup for API keys
+    - JWT token validation
+    - IAM role assumption
+    - OAuth2/OIDC integration
     """
     
-    # Get valid API keys from environment variable
+    # Get valid API keys from environment (temporary)
     valid_keys = os.environ.get('VALID_API_KEYS', '').split(',')
     
-    # For demo, accept any key that starts with 'cloudops_'
-    if api_key.startswith('cloudops_'):
-        return True
+    # Basic validation
+    if not api_key or not api_key.startswith('cloudops_'):
+        return {'valid': False, 'error': 'Invalid API key format'}
     
-    return api_key in valid_keys
+    # TODO: Query DynamoDB for key metadata
+    # key_data = dynamodb.get_item(Key={'api_key': api_key})
+    
+    # For now, accept any key with correct prefix
+    if api_key in valid_keys or api_key.startswith('cloudops_'):
+        return {
+            'valid': True,
+            'user_id': 'demo_user',
+            'tenant_id': 'demo_tenant',
+            'permissions': ['investigate', 'read'],
+            'note': 'Using demo auth - implement proper auth for production'
+        }
+    
+    return {'valid': False, 'error': 'API key not found'}
 
 
 def success_response(data: dict) -> dict:
