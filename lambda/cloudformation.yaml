@@ -1,0 +1,195 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudOps AI API - Phase 1 Deployment'
+
+Parameters:
+  ApiKeySecret:
+    Type: String
+    Default: 'cloudops_demo_key_12345'
+    Description: 'API key for authentication (change this!)'
+    NoEcho: true
+
+Resources:
+  # Lambda Execution Role
+  CloudOpsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CloudOpsLambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-09'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudOpsLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-09'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Lambda Function
+  CloudOpsAIFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: cloudops-ai-api
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt CloudOpsLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          VALID_API_KEYS: !Ref ApiKeySecret
+      Code:
+        ZipFile: |
+          import json
+          import os
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  query = body.get('query', '')
+                  
+                  if not query:
+                      return error_response(400, "Missing 'query' parameter")
+                  
+                  api_key = event.get('headers', {}).get('x-api-key', '')
+                  if not api_key.startswith('cloudops_'):
+                      return error_response(401, "Invalid API key")
+                  
+                  classification = classify_incident(query)
+                  plan = generate_plan(classification)
+                  recommendations = generate_recommendations(classification)
+                  
+                  return success_response({
+                      'classification': classification,
+                      'plan': plan,
+                      'recommendations': recommendations,
+                      'timestamp': datetime.utcnow().isoformat()
+                  })
+              except Exception as e:
+                  return error_response(500, str(e))
+
+          def classify_incident(query):
+              query_lower = query.lower()
+              if any(w in query_lower for w in ['cpu', 'memory', 'high']):
+                  return {'primary_class': 'resource_saturation', 'confidence': 0.85, 'query': query}
+              elif any(w in query_lower for w in ['slow', 'latency']):
+                  return {'primary_class': 'performance_degradation', 'confidence': 0.80, 'query': query}
+              elif any(w in query_lower for w in ['down', 'crash']):
+                  return {'primary_class': 'availability_loss', 'confidence': 0.90, 'query': query}
+              return {'primary_class': 'unknown', 'confidence': 0.50, 'query': query}
+
+          def generate_plan(classification):
+              strategies = {
+                  'resource_saturation': ['analyze_utilization', 'compare_baseline', 'check_scaling'],
+                  'performance_degradation': ['analyze_latency', 'trace_dependencies'],
+                  'availability_loss': ['check_status', 'check_health']
+              }
+              primitives = strategies.get(classification['primary_class'], ['analyze_utilization'])
+              return {
+                  'plan_id': f"plan-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
+                  'primitives': primitives
+              }
+
+          def generate_recommendations(classification):
+              return {
+                  'actions': [
+                      {'priority': 1, 'action': 'Check CloudWatch metrics'},
+                      {'priority': 2, 'action': 'Review recent changes'}
+                  ]
+              }
+
+          def success_response(data):
+              return {
+                  'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+                  'body': json.dumps(data)
+              }
+
+          def error_response(code, msg):
+              return {
+                  'statusCode': code,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({'error': msg})
+              }
+
+  # API Gateway
+  CloudOpsAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: cloudops-ai-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - '*'
+
+  # API Integration
+  CloudOpsAPIIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref CloudOpsAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CloudOpsAIFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  # API Route
+  CloudOpsAPIRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref CloudOpsAPI
+      RouteKey: 'POST /investigate'
+      Target: !Join
+        - /
+        - - integrations
+          - !Ref CloudOpsAPIIntegration
+
+  # API Stage
+  CloudOpsAPIStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref CloudOpsAPI
+      StageName: prod
+      AutoDeploy: true
+
+  # Lambda Permission for API Gateway
+  CloudOpsAPIPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CloudOpsAIFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CloudOpsAPI}/*'
+
+Outputs:
+  APIEndpoint:
+    Description: 'CloudOps AI API Endpoint'
+    Value: !Sub 'https://${CloudOpsAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/investigate'
+    Export:
+      Name: CloudOpsAPIEndpoint
+
+  APIKey:
+    Description: 'API Key for testing (CHANGE THIS IN PRODUCTION!)'
+    Value: !Ref ApiKeySecret
+
+  TestCommand:
+    Description: 'Test command'
+    Value: !Sub |
+      curl -X POST https://${CloudOpsAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/investigate \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: ${ApiKeySecret}" \
+        -d '{"query": "high CPU on RDS"}'
